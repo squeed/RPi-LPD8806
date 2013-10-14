@@ -90,7 +90,7 @@ class ColorHSV(Color):
 	
 	def getRGB(self):
 		"""Return RGB 3-tuple"""
-		return colorsys.hsv_to_rgb(self.H / 360.0, self.S, self.V)
+		return [x * 255 for x in colorsys.hsv_to_rgb(self.H / 360.0, self.S, self.V)]
 
 	def __str__( self ):
 		return "%0.2f,%0.2f,%0.2f" % (self.H, self.S, self.V)
