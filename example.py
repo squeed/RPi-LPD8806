@@ -71,13 +71,13 @@ led.all_off()
 #after each step, call update() to push it to the LED strip
 #sin wave animations
 color = Color(255, 0, 0)
-for i in range(led.lastIndex):
+for i in range(led.num_leds):
 	led.anim_wave(color, 4)
 	led.update()
 	sleep(0.15)
 	
 color = Color(0, 0, 100)
-for i in range(led.lastIndex):
+for i in range(led.num_leds):
 	led.anim_wave(color, 2)
 	led.update()
 	sleep(0.15)
@@ -123,14 +123,14 @@ led.fillOff()
 
 #scanner: single color and changing color
 color = Color(255, 0, 0)
-for i in range(led.lastIndex*4):
+for i in range(led.num_leds*4):
 	led.anim_larson_scanner(color)
 	led.update()
 	sleep(0.03)
 
 led.fillOff()
 
-for i in range(led.lastIndex*4):
+for i in range(led.num_leds*4):
 	led.anim_larson_rainbow(2, 0.5)
 	led.update()
 	sleep(0.03)

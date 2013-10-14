@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import colorsys
 import math
+import collections
 
 """
 LPD8806.py: Raspberry Pi library for LPD8806 based RGB light strips
@@ -59,13 +60,17 @@ class Color:
 	def getColorHSV(self):
 		h, s, v = colorsys.rgb_to_hsv(self.R / 255.0, self.G / 255.0, self.B / 255.0)
 		return ColorHSV(h * 360, s, v)
+	
+	def getRGB(self):
+		"""Return RGB 3-tuple"""
+		return (self.R, self.G, self.B)
 
 	def __str__( self ):
 		return "%d,%d,%d" % (self.R, self.G, self.B)
 		
 #useful for natural color transitions. Increment hue to sweep through the colors
 #must call getColorRGB() before passing to any of the methods
-class ColorHSV:
+class ColorHSV(Color):
 	def __init__(self, h=360.0, s=1.0, v=1.0):
 		if(h > 360.0 or h < 0.0):
 			raise ValueError('Hue value must be between 0.0 and 360.0')
@@ -82,28 +87,32 @@ class ColorHSV:
 	def getColorRGB(self):
 		r, g, b = colorsys.hsv_to_rgb(self.H / 360.0, self.S, self.V)
 		return Color(r * 255.0, g * 255.0, b * 255.0)
-		
+	
+	def getRGB(self):
+		"""Return RGB 3-tuple"""
+		return colorsys.hsv_to_rgb(self.H / 360.0, self.S, self.V)
+
 	def __str__( self ):
 		return "%0.2f,%0.2f,%0.2f" % (self.H, self.S, self.V)
 		
 
 class LEDStrip:
 
-	def __init__(self, leds, dev="/dev/spidev0.0"):
+	def __init__(self, num_leds, dev="/dev/spidev0.0"):
 		#Variables:
-		#	leds -- strand size
+		#	num_leds -- strand size
 		#	dev -- spi device
 		
 		self.c_order = ChannelOrder.GRB
 		self.dev = dev
 		self.spi = open(self.dev, "wb")
-		self.leds = leds
-		self.lastIndex = self.leds - 1
+		self.num_leds = num_leds
+		self.latch_bytes = int((num_leds + 31) / 32)
 		self.gamma = bytearray(256)
-		self.buffer = [0 for x in range(self.leds + 1)]
+		self.buffer = [bytearray(3) for x in range(self.num_leds )]
 		
 		self.masterBrightness = 1.0
-		
+
 		#anim step vars
 		self.rainbowStep = 0
 		self.rainbowCycleStep = 0
@@ -114,14 +123,18 @@ class LEDStrip:
 		self.larsonLast = 0
 		self.waveStep = 0
 		
-		for led in range(self.leds):
-			self.buffer[led] = bytearray(3)
 		for i in range(256):
 			# Color calculations from
 			# http://learn.adafruit.com/light-painting-with-raspberry-pi
 			self.gamma[i] = 0x80 | int(
 				pow(float(i) / 255.0, 2.5) * 127.0 + 0.5
 			)
+
+		#Do a latch to get the LED to a known-good state
+		self._latch()
+
+		#Update each buffer to off
+		self[0:] =  [ [0,0,0] ] * self.num_leds
 
 	#Allows for easily using LED strands with different channel orders
 	def setChannelOrder(self, order):
@@ -132,71 +145,120 @@ class LEDStrip:
 		if(bright > 1.0 or bright < 0.0):
 			raise ValueError('Brightness must be between 0.0 and 1.0')
 		self.masterBrightness = bright
+	
+	def _latch(self):
+		self.spi.write(bytearray( b'\x00' * self.latch_bytes ))
+		self.spi.flush()
+		
 		
 	#Push new data to strand
 	def update(self):
-		for x in range(self.leds):
-			self.spi.write(self.buffer[x])
-			self.spi.flush()
-		self.spi.write(bytearray(b'\x00\x00\x00')) #zero fill the last to prevent stray colors at the end
-		self.spi.write(bytearray(b'\x00'))
-		self.spi.flush()
+		for entry in self.buffer: 
+			self.spi.write(entry)
+		self._latch()
 		
+	###
+	## implement the container protocol
+	###
+
+	def __len__(self):
+		return len(self.buffer)
+	
+	#return the (r,g,b) 3-tuple
+	def __getitem__ (self, key):
+		return self.buffer[key]
+	
+	def __setitem__(self, key, value):
+		"""Set a particular pixel.
+
+		Value can be either a Color object or a (r,g,b) 3-tuple
+		"""
+
+		if isinstance(key, slice):
+			i = key.start
+			stop = key.stop
+			step = key.step
+			if not stop:
+				stop = self.num_leds
+			if not step:
+				step = 1
+
+			while i < stop:
+				v = value.pop(0)
+				if isinstance(v, Color):
+					v = v.getRGB()
+				if len(v) != 3:
+					raise ValueError("Input must be Color or 3-tuple")
+				self[i] = v
+				i += step
+			return
+
+		if isinstance(value, Color):
+			value = value.getRGB()
+		if len(value) != 3:
+			raise ValueError("Input must be Color or 3-tuple")
+
+		for dest, val in zip(self.c_order, value):
+			self.buffer[key][dest] = self.gamma[int(val * self.masterBrightness)]
+
+	
+	def __delitem__(self, key):
+		del self.buffer[key]
+	
+
+	#####
+	##
+	## Some utility functions
+	##
+	####
+	
 	#Fill the strand (or a subset) with a single color using a Color object
-	def fill(self, color, start=0, end=0):
-		if start < 0:
-			start = 0
-		if end == 0 or end > self.lastIndex:
-			end = self.lastIndex
-		for led in range(start, end + 1): #since 0-index include end in range
-			self.__set_internal(led, color)
+	def fill(self, color, start = 0, end = None):
+		if end == None:
+			end = self.num_leds
+		self[start:end] = [ color] * (end - start)
+	
 
 	#Fill the strand (or a subset) with a single color using RGB values
-	def fillRGB(self, r, g, b, start=0, end=0):
-		self.fill(Color(r, g, b), start, end)
+	def fillRGB(self, r, g, b, start=0, end=None):
+		if end == None:
+			end = self.num_leds
+
+		self[start:end] = [[r,g,b]] * (end - start)
 		
 	#Fill the strand (or a subset) with a single color using HSV values
-	def fillHSV(self, h, s, v, start=0, end=0):
-		self.fill(ColorHSV(h, s, v).getColorRGB(), start, end)
+	def fillHSV(self, h, s, v, start=0, end=None):
+		self.fill(ColorHSV(h ,s, v), start=start, end=end)
+
 
 	#Fill the strand (or a subset) with a single color using a Hue value. 
 	#Saturation and Value components of HSV are set to max.
-	def fillHue(self, hue, start=0, end=0):
-		self.fill(ColorHSV(hue).getColorRGB(), start, end)
+	def fillHue(self, hue, start=0, end=None):
+		self.fill(ColorHSV(hue), start=start, end=end)
 		
-	def fillOff(self, start=0, end=0):
-		self.fillRGB(0, 0, 0, start, end)
+	def fillOff(self, start=0, end=None):
+		self.fill(Color(0,0,0), start=start, end=end)
 
-	#internal use only. sets pixel color
-	def __set_internal(self, pixel, color):
-		if(pixel < 0 or pixel > self.lastIndex):
-			return; #don't go out of bounds
-
-		self.buffer[pixel][self.c_order[0]] = self.gamma[int(color.R * self.masterBrightness)]
-		self.buffer[pixel][self.c_order[1]] = self.gamma[int(color.G * self.masterBrightness)]
-		self.buffer[pixel][self.c_order[2]] = self.gamma[int(color.B * self.masterBrightness)]
-		
 	#Set single pixel to Color value
 	def set(self, pixel, color):
-		self.__set_internal(pixel, color)
+		self[pixel] = color
 
 	#Set single pixel to RGB value
 	def setRGB(self, pixel, r, g, b):
-		color = Color(r, g, b)
-		self.set(pixel, color)
+		self[pixel] = (r, g, b)
 		
 	#Set single pixel to HSV value
 	def setHSV(self, pixel, h, s, v):
-		self.set(pixel, ColorHSV(h, s, v).getColorRGB())
+		self[pixel] = ColorHSV(h, s, v)
 
 	#Set single pixel to Hue value.
 	#Saturation and Value components of HSV are set to max.
 	def setHue(self, pixel, hue):
-		self.set(pixel, ColorHSV(hue).getColorRGB())
+		self[pixel] =  ColorHSV(hue)
 		
 	#turns off the desired pixel
 	def setOff(self, pixel):
-		self.setRGB(pixel, 0, 0, 0)
+		self[pixel] = (0, 0, 0)
 
 	#Turn all LEDs off.
 	def all_off(self):
@@ -204,7 +266,7 @@ class LEDStrip:
 		self.update()
 		self.fillOff()
 		self.update()
-		
+
 	#Get color from wheel value (0 - 384)
 	def wheel_color(self, wheelpos):
 		if wheelpos < 0:
@@ -230,9 +292,9 @@ class LEDStrip:
 
 	#generate rainbow
 	def anim_rainbow(self, start=0, end=0):
-		if end == 0 or end > self.lastIndex:
-			end = self.lastIndex
-		size = end - start + 1
+		if end == 0 or end > self.num_leds:
+			end = self.num_leds
+		size = end - start 
 		
 		for i in range(size):
 			color = (i + self.rainbowStep) % 384
@@ -246,9 +308,9 @@ class LEDStrip:
 		
 	#Generate rainbow wheel equally distributed over strip
 	def anim_rainbow_cycle(self, start=0, end=0):
-		if end == 0 or end > self.lastIndex:
-			end = self.lastIndex
-		size = end - start + 1
+		if end == 0 or end > self.num_leds:
+			end = self.num_leds
+		size = end - start 
 		
 		for i in range(size):
 			color = (i * (384 / size) + self.rainbowCycleStep) % 384
@@ -261,8 +323,8 @@ class LEDStrip:
 		
 	#fill the dots progressively along the strip
 	def anim_color_wipe(self, color, start=0, end=0):
-		if end == 0 or end > self.lastIndex:
-			end = self.lastIndex
+		if end == 0 or end > self.num_leds:
+			end = self.num_leds
 			
 		if(self.wipeStep == 0):
 			self.fillOff()
@@ -270,30 +332,30 @@ class LEDStrip:
 		self.set(start + self.wipeStep, color)
 		
 		self.wipeStep += 1
-		if start + self.wipeStep > end:
+		if start + self.wipeStep >= end:
 			self.wipeStep = 0
 		
 	#chase one pixel down the strip
 	def anim_color_chase(self, color, start=0, end=0):
-		if end == 0 or end > self.lastIndex:
-			end = self.lastIndex
+		if end == 0 or end > self.num_leds:
+			end = self.num_leds
 			
 		if(self.chaseStep == 0):
-			self.setOff(end)
+			self.setOff(end - 1)
 		else:
-			self.setOff(start + self.chaseStep - 1)
+			self.setOff(start + self.chaseStep )
 			
 		self.set(start + self.chaseStep, color)
 
 		self.chaseStep += 1
-		if start + self.chaseStep > end:
+		if start + self.chaseStep >= end:
 			self.chaseStep = 0
 		
 	#larson scanner (i.e. Cylon Eye or K.I.T.T.)
 	def anim_larson_scanner(self, color, tail=2, fade=0.75, start=0, end=0):
-		if end == 0 or end > self.lastIndex:
-			end = self.lastIndex
-		size = end - start + 1
+		if end == 0 or end > self.num_leds:
+			end = self.num_leds
+		size = end - start 
 		
 		tail += 1 #makes tail math later easier
 		if tail >= size / 2:
@@ -303,25 +365,25 @@ class LEDStrip:
 		self.set(self.larsonLast, color)
 		
 		tl = tail
-		if(self.larsonLast + tl > end):
+		if(self.larsonLast + tl >= end):
 			tl = end - self.larsonLast
 		tr = tail
 		if(self.larsonLast - tr < start):
 			tr = self.larsonLast - start
 			
-		for l in range(1, tl + 1):
+		for l in range(0, tl):
 			level = (float(tail - l) / float(tail)) * fade
 			self.setRGB(self.larsonLast + l, color.R * level, color.G * level, color.B * level)
 
-		if(self.larsonLast + tl + 1 <= end):
-			self.setOff(self.larsonLast + tl + 1)
+		if(self.larsonLast + tl <= end):
+			self.setOff(self.larsonLast + tl)
 			
-		for r in range(1, tr + 1):
+		for r in range(0, tr):
 			level = (float(tail - r) / float(tail)) * fade
 			self.setRGB(self.larsonLast - r, color.R * level, color.G * level, color.B * level)
 
 			
-		if(self.larsonLast - tr - 1 >= start):
+		if(self.larsonLast - tr  >= start):
 			self.setOff(self.larsonLast - tr - 1)
 		
 		if start + self.larsonStep == end:
@@ -333,9 +395,9 @@ class LEDStrip:
 		
 	#larson scanner (i.e. Cylon Eye or K.I.T.T.) but Rainbow
 	def anim_larson_rainbow(self, tail=2, fade=0.75, start=0, end=0):
-		if end == 0 or end > self.lastIndex:
-			end = self.lastIndex
-		size = end - start + 1
+		if end == 0 or end > self.num_leds:
+			end = self.num_leds
+		size = end - start 
 		
 		hue = (self.larsonStep * (360 / size))
 		
@@ -344,9 +406,9 @@ class LEDStrip:
 	#Sine wave animation
 	PI = 3.14159265
 	def anim_wave(self, color, cycles, start=0, end=0):
-		if end == 0 or end > self.lastIndex:
-			end = self.lastIndex
-		size = end - start + 1
+		if end == 0 or end > self.num_leds:
+			end = self.num_leds
+		size = end - start 
 		
 		c2 = Color()
 		for i in range(size):
@@ -354,7 +416,7 @@ class LEDStrip:
 			if(y >= 0.0):
 				#Peaks of sine wave are white
 				y = 1.0 - y #Translate Y to 0.0 (top) to 1.0 (center)
-				c2 = Color(255 - float(255 - color.R) * y, 255 - float(255 - color.G) * y, 255 - float(255 - color.B) * y)		   
+				c2 = Color(255 - float(255 - color.R) * y, 255 - float(255 - color.G) * y, 255 - float(255 - color.B) * y) 
 			else:
 				#Troughs of sine wave are black
 				y += 1.0 #Translate Y to 0.0 (bottom) to 1.0 (center)
