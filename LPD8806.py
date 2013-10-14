@@ -36,8 +36,8 @@ Example:
 class ChannelOrder:
 	RGB = [0,1,2] #Probably not used, here for clarity
 	
-	GRB = [1,0,2] #Strands from Adafruit and some others (default)
-	BRG = [1,2,0] #Strands from many other manufacturers
+	GRB = [1,2,0] #Strands from Adafruit and some others (default)
+	BRG = [1,0,2] #Strands from many other manufacturers
 	
 	
 	
@@ -175,13 +175,7 @@ class LEDStrip:
 		"""
 
 		if isinstance(key, slice):
-			i = key.start
-			stop = key.stop
-			step = key.step
-			if not stop:
-				stop = self.num_leds
-			if not step:
-				step = 1
+			(i, stop, step) = key.indices(self.num_leds)
 
 			while i < stop:
 				v = value.pop(0)
